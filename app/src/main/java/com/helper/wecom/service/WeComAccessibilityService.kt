@@ -201,15 +201,17 @@ class WeComAccessibilityService : AccessibilityService() {
             Log.d("WeComService", "Screen waked up via Full WakeLock")
         }
 
-        // Try legacy KeyguardLock (deprecated but often works on MIUI 12)
-        @Suppress("DEPRECATION")
-        val keyguardLock = keyguardManager.newKeyguardLock("WeComHelper:KeyguardLock")
-        keyguardLock.disableKeyguard()
+        if (keyguardManager.isKeyguardLocked) {
+            // Try legacy KeyguardLock (deprecated but often works on MIUI 12)
+            @Suppress("DEPRECATION")
+            val keyguardLock = keyguardManager.newKeyguardLock("WeComHelper:KeyguardLock")
+            keyguardLock.disableKeyguard()
 
-        // Perform a swipe up gesture to bypass "Swipe to unlock"
-        serviceScope.launch {
-            delay(1000) // Wait for screen to fully turn on
-            unlockBySwipe()
+            // Perform a swipe up gesture to bypass "Swipe to unlock"
+            serviceScope.launch {
+                delay(1000) // Wait for screen to fully turn on
+                unlockBySwipe()
+            }
         }
     }
 
@@ -255,101 +257,185 @@ class WeComAccessibilityService : AccessibilityService() {
     }
 
     private suspend fun handleWorkflow() {
-        // Fetch fresh root node inside the coroutine to ensure it's not stale
         val rootNode = rootInActiveWindow ?: return
         
         try {
-            Log.d("WeComService", "Checking UI state...")
+            val currentPackage = rootNode.packageName?.toString()
+            if (currentPackage != "com.tencent.wework") {
+                Log.d("WeComService", "Not in WeCom, skip. Package: $currentPackage")
+                return
+            }
 
-            // Priority 1: Handle Mass Send specific buttons
-            val sendButton = findSendButton(rootNode)
-            if (sendButton != null) {
-                try {
-                    Log.d("WeComService", "Found Send Button")
-                    if (clickNode(sendButton)) {
-                        delay(1000)
-                        return
-                    }
-                } finally {
-                    sendButton.recycle()
-                }
+            // 1. Identify current screen state
+            val pageTitle = findNodeByViewId(rootNode, "com.tencent.wework:id/mkq")?.text?.toString() ?: ""
+            Log.d("WeComService", "Current Page Title: $pageTitle")
+
+            // 2. Priority Actions based on screen
+            if (pageTitle == "群发助手") {
+                handleMassAssistantPage(rootNode)
+                return
+            }
+
+            // ABSOLUTE PRIORITY: Look for "群发助手" item in any list (Message List)
+            // This handles the case where we are on the "Messages" tab or it's visible.
+            if (clickMassAssistantInMessageList(rootNode)) return
+
+            if (pageTitle == "收件人" || tryClickByText(rootNode, "发送", isBottomUp = true)) {
+                // If we see a "Send" button and it's likely a sub-page of mass sending
+                return
             }
 
             if (tryClickByText(rootNode, "确定")) {
                 return
             }
 
-            // Priority 2: Try to find and click "群发助手" (Mass Assistant)
-            val massAssistant = findNodeByText(rootNode, "群发助手")
-            if (massAssistant != null) {
+            // 3. Navigation Actions (Priority: Message List -> Workbench)
+            // If in Message List, look for Mass Assistant chat (High Priority)
+            if (pageTitle == "消息") {
+                if (clickMassAssistantInMessageList(rootNode)) return
+            }
+
+            // If in Workbench, look for Mass Assistant entry
+            if (pageTitle == "工作台") {
+                if (tryClickByText(rootNode, "群发助手")) return
+            }
+
+            // Fallback: If lost or in a group chat, go to "Messages" tab first
+            val messagesTab = findNodeByText(rootNode, "消息")
+            if (messagesTab != null) {
                 try {
-                    Log.d("WeComService", "Found Mass Assistant")
-                    if (clickNode(massAssistant)) {
-                        delay(1000)
-                        return
+                    // Avoid clicking the title, look for the bottom tab (Y > 1700)
+                    val rect = android.graphics.Rect()
+                    messagesTab.getBoundsInScreen(rect)
+                    if (rect.centerY() > 1700) {
+                        if (clickNode(messagesTab)) return
                     }
                 } finally {
-                    massAssistant.recycle()
+                    messagesTab.recycle()
                 }
             }
 
-            // Priority 3: If not in Mass Assistant, try to go to Workbench
+            // Secondary Fallback: go to Workbench
             val workbench = findNodeByText(rootNode, "工作台")
             if (workbench != null) {
                 try {
-                    Log.d("WeComService", "Clicking Workbench")
-                    if (clickNode(workbench)) {
-                        delay(1000)
-                        return
-                    }
+                    if (clickNode(workbench)) return
                 } finally {
                     workbench.recycle()
                 }
             }
         } finally {
-            // Always recycle the root node retrieved from rootInActiveWindow
             rootNode.recycle()
         }
     }
 
-    private fun findSendButton(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        // Search by "发" to cover all variants ("发送", "发 送", etc.)
-        val nodes = rootNode.findAccessibilityNodeInfosByText("发")
-        if (nodes.isNullOrEmpty()) return null
-
-        // Regex to strip all possible spacing characters including full-width, non-breaking spaces
-        val spaceRegex = "[\\s\\u00A0\\u2007\\u202F\\u3000]+".toRegex()
-
-        // 1. Prioritize exact match of "发送" after removing all kinds of spaces.
-        val exactMatches = nodes.filter { node ->
-            val text = node.text?.toString()?.replace(spaceRegex, "") ?: ""
-            val desc = node.contentDescription?.toString()?.replace(spaceRegex, "") ?: ""
-            text == "发送" || desc == "发送"
-        }
-
-        val result = if (exactMatches.isNotEmpty()) {
-            // We want the most recent/bottom one
-            exactMatches.last() 
-        } else {
-            // 2. Fallback: look for a node that contains "发送" but NOT "已发送"
-            // This handles cases where the text is bundled in the entire task box description
-            val partialMatches = nodes.filter { node ->
-                val text = node.text?.toString()?.replace(spaceRegex, "") ?: ""
-                val desc = node.contentDescription?.toString()?.replace(spaceRegex, "") ?: ""
-                (text.contains("发送") && !text.contains("已发送")) || 
-                (desc.contains("发送") && !desc.contains("已发送"))
-            }
-            if (partialMatches.isNotEmpty()) {
-                partialMatches.last()
-            } else {
-                null
+    private suspend fun handleMassAssistantPage(rootNode: AccessibilityNodeInfo) {
+        val sendButton = findSendButton(rootNode)
+        if (sendButton != null) {
+            try {
+                Log.d("WeComService", "Found Send Button in Mass Assistant")
+                if (clickNode(sendButton)) {
+                    delay(2000)
+                    return
+                }
+            } finally {
+                sendButton.recycle()
             }
         }
 
-        // Recycle unused nodes
-        nodes.forEach { if (it != result) it.recycle() }
+        // Ultimate fallback for the blue button region
+        Log.d("WeComService", "Mass Assistant: Triggering coordinate fallback tap")
+        if (dispatchCoordinateClick(900f, 1750f)) {
+            delay(2000)
+        }
+    }
 
+    private fun clickMassAssistantInMessageList(rootNode: AccessibilityNodeInfo): Boolean {
+        // Search specifically within the message list area to avoid tabs
+        val nodes = rootNode.findAccessibilityNodeInfosByText("群发助手")
+        if (nodes.isNullOrEmpty()) return false
+        
+        Log.d("WeComService", "Searching for '群发助手': found ${nodes.size} candidates")
+        
+        // Find the one that belongs to a RelativeLayout (typical for list items)
+        // and is above the tab bar (y < 1700) but below title (y > 200)
+        val rect = android.graphics.Rect()
+        val candidate = nodes.firstOrNull { node ->
+            node.getBoundsInScreen(rect)
+            val isMainListArea = rect.centerY() in 200..1700
+            val isListItemText = node.className?.contains("TextView") == true
+            
+            if (isListItemText && !isMainListArea) {
+                Log.d("WeComService", "Skipping Mass Assistant title at y=${rect.centerY()}")
+            }
+            
+            isListItemText && isMainListArea
+        }
+        
+        if (candidate != null) {
+            candidate.getBoundsInScreen(rect)
+            Log.d("WeComService", "Found Mass Assistant button at y=${rect.centerY()}")
+        }
+
+        val result = if (candidate != null) clickNode(candidate) else false
+        nodes.forEach { it.recycle() }
         return result
+    }
+
+    private fun findNodeByViewId(rootNode: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? {
+        val nodes = rootNode.findAccessibilityNodeInfosByViewId(id)
+        val result = nodes?.firstOrNull()
+        nodes?.forEach { if (it != result) it.recycle() }
+        return result
+    }
+
+    private fun findSendButton(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        // 1. Try to find the specific "发送" text node first
+        val nodes = rootNode.findAccessibilityNodeInfosByText("发送")
+        if (!nodes.isNullOrEmpty()) {
+            val spaceRegex = "[\\s\\u00A0\\u2007\\u202F\\u3000]+".toRegex()
+            // Prefer clickable "发送" text
+            val exactButton = nodes.lastOrNull { node ->
+                val text = node.text?.toString()?.replace(spaceRegex, "") ?: ""
+                text == "发送" && (node.isClickable || node.parent?.isClickable == true)
+            }
+            if (exactButton != null) {
+                nodes.forEach { if (it != exactButton) it.recycle() }
+                Log.d("WeComService", "Found specific '发送' text node")
+                return exactButton
+            }
+            nodes.forEach { it.recycle() }
+        }
+
+        // 2. Fallback to ID container search
+        val idNodes = rootNode.findAccessibilityNodeInfosByViewId("com.tencent.wework:id/htp")
+        if (!idNodes.isNullOrEmpty()) {
+            val pendingNode = idNodes.lastOrNull { node ->
+                val allText = getAllText(node)
+                allText.contains("发送") && !allText.contains("已发送")
+            }
+            
+            idNodes.forEach { if (it != pendingNode) it.recycle() }
+            if (pendingNode != null) {
+                Log.d("WeComService", "Found Send button container via ID: ${pendingNode.viewIdResourceName}")
+                return pendingNode
+            }
+        }
+
+        return null
+    }
+
+    private fun getAllText(node: AccessibilityNodeInfo): String {
+        val sb = StringBuilder()
+        sb.append(node.text ?: "").append(" ").append(node.contentDescription ?: "")
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i)
+            if (child != null) {
+                sb.append(" ").append(getAllText(child))
+                child.recycle()
+            }
+        }
+        return sb.toString()
     }
 
     private fun tryClickByText(rootNode: AccessibilityNodeInfo, text: String, isBottomUp: Boolean = false): Boolean {
@@ -392,11 +478,11 @@ class WeComAccessibilityService : AccessibilityService() {
 
     private fun clickNode(node: AccessibilityNodeInfo): Boolean {
         var depth = 0
-        // List to keep track of parents so we can recycle them if they are not the node itself
         val parentsToRecycle = mutableListOf<AccessibilityNodeInfo>()
 
         var current: AccessibilityNodeInfo = node
-        while (!current.isClickable && depth < 10) { // Increased depth to 10
+        // Check if the node itself or its parents are clickable
+        while (!current.isClickable && depth < 10) {
             val parent = current.parent ?: break
             parentsToRecycle.add(parent)
             current = parent
@@ -404,17 +490,60 @@ class WeComAccessibilityService : AccessibilityService() {
         }
 
         val result = if (current.isClickable) {
+            // First try accessibility click
             val success = current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            Log.d("WeComService", "Click result for text [${node.text ?: node.contentDescription}]: $success. Clicked node class: ${current.className}")
+            Log.d("WeComService", "Accessibility click [${node.text ?: node.contentDescription}]: $success. Class: ${current.className}")
+            
+            // Special handling for the large htp container or if accessiblity click might be ignored
+            if (current.viewIdResourceName == "com.tencent.wework:id/htp") {
+                // For htp, always try coordinate click at the bottom region
+                clickAtBottomRegionOf(current)
+            } else {
+                // For other nodes, use center click
+                clickAtCenterOf(current)
+            }
             success
         } else {
-            Log.w("WeComService", "Node text [${node.text ?: node.contentDescription}] or its parents are not clickable. Max depth reached: $depth")
-            false
+            Log.w("WeComService", "Node not clickable. Trying coordinate click as fallback.")
+            clickAtCenterOf(node)
         }
 
-        // Recycle all parents except possibly the target if it was the original node (which is recycled by the caller)
         parentsToRecycle.forEach { if (it != node) it.recycle() }
+        return result
+    }
 
+    private fun clickAtBottomRegionOf(node: AccessibilityNodeInfo): Boolean {
+        val rect = android.graphics.Rect()
+        node.getBoundsInScreen(rect)
+        // From XML, the blue button is at the very bottom of the [44,1397][1036,1865] container.
+        // Let's click 10% from the bottom and center-X.
+        val x = rect.centerX().toFloat()
+        val y = rect.bottom - (rect.height() * 0.1f)
+
+        return dispatchCoordinateClick(x, y)
+    }
+
+    private fun clickAtCenterOf(node: AccessibilityNodeInfo): Boolean {
+        val rect = android.graphics.Rect()
+        node.getBoundsInScreen(rect)
+        val x = rect.centerX().toFloat()
+        val y = rect.centerY().toFloat()
+
+        return dispatchCoordinateClick(x, y)
+    }
+
+    private fun dispatchCoordinateClick(x: Float, y: Float): Boolean {
+        val path = Path()
+        path.moveTo(x, y)
+        val gestureBuilder = GestureDescription.Builder()
+        gestureBuilder.addStroke(GestureDescription.StrokeDescription(path, 0, 50))
+        
+        val result = dispatchGesture(gestureBuilder.build(), object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                Log.d("WeComService", "Coordinate click completed at ($x, $y)")
+            }
+        }, null)
+        Log.d("WeComService", "Dispatching coordinate click at ($x, $y): $result")
         return result
     }
     override fun onInterrupt() {
