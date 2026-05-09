@@ -30,6 +30,7 @@ class WeComAccessibilityService : AccessibilityService() {
     private var endMinute = 10
     private var autoWake = false
     private var executionMode = 0 // 0: Immediate, 1: Scheduled
+    private var isWakingUp = false
     private lateinit var prefs: SharedPreferences
 
     private val configListener = SharedPreferences.OnSharedPreferenceChangeListener { p, key ->
@@ -188,29 +189,44 @@ class WeComAccessibilityService : AccessibilityService() {
     }
 
     private fun wakeScreenAndUnlock(powerManager: PowerManager, keyguardManager: KeyguardManager) {
-        if (!powerManager.isInteractive) {
-            // Use FULL_WAKE_LOCK (deprecated but more effective for waking on old MIUI)
-            @Suppress("DEPRECATION")
-            val wakeLock = powerManager.newWakeLock(
-                PowerManager.FULL_WAKE_LOCK or
-                        PowerManager.ACQUIRE_CAUSES_WAKEUP or
-                        PowerManager.ON_AFTER_RELEASE,
-                "WeComHelper:WakeLock"
-            )
-            wakeLock.acquire(10000) // Keep screen on for 10 seconds
-            Log.d("WeComService", "Screen waked up via Full WakeLock")
-        }
+        val needsWake = !powerManager.isInteractive
+        val needsUnlock = keyguardManager.isKeyguardLocked
 
-        if (keyguardManager.isKeyguardLocked) {
-            // Try legacy KeyguardLock (deprecated but often works on MIUI 12)
-            @Suppress("DEPRECATION")
-            val keyguardLock = keyguardManager.newKeyguardLock("WeComHelper:KeyguardLock")
-            keyguardLock.disableKeyguard()
+        // If everything is already fine or we are already in progress, skip
+        if (!(needsWake || needsUnlock) || isWakingUp) return
 
-            // Perform a swipe up gesture to bypass "Swipe to unlock"
-            serviceScope.launch {
-                delay(1000) // Wait for screen to fully turn on
-                unlockBySwipe()
+        isWakingUp = true
+        serviceScope.launch {
+            try {
+                if (needsWake) {
+                    // Use FULL_WAKE_LOCK (deprecated but more effective for waking on old MIUI)
+                    @Suppress("DEPRECATION")
+                    val wakeLock = powerManager.newWakeLock(
+                        PowerManager.FULL_WAKE_LOCK or
+                                PowerManager.ACQUIRE_CAUSES_WAKEUP or
+                                PowerManager.ON_AFTER_RELEASE,
+                        "WeComHelper:WakeLock"
+                    )
+                    wakeLock.acquire(5000) // Keep screen on for 5 seconds
+                    Log.d("WeComService", "Screen waked up via Full WakeLock")
+                    delay(1000) // Wait for screen to fully turn on
+                }
+
+                if (keyguardManager.isKeyguardLocked) {
+                    // Try legacy KeyguardLock (deprecated but often works on MIUI 12)
+                    @Suppress("DEPRECATION")
+                    val keyguardLock = keyguardManager.newKeyguardLock("WeComHelper:KeyguardLock")
+                    keyguardLock.disableKeyguard()
+
+                    // Perform a swipe up gesture to bypass "Swipe to unlock"
+                    Log.d("WeComService", "Attempting swipe to unlock")
+                    unlockBySwipe()
+                    delay(1000)
+                }
+            } catch (e: Exception) {
+                Log.e("WeComService", "Wake/Unlock failed", e)
+            } finally {
+                isWakingUp = false
             }
         }
     }
