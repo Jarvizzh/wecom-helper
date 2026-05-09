@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">企微助手</string>
+    <string name="accessibility_service_description">用于企业微信自动化操作，如自动点击群发助手发送按钮。</string>
+</resources>
