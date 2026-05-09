@@ -282,12 +282,37 @@ class WeComAccessibilityService : AccessibilityService() {
                 return
             }
 
-            // 1. Identify current screen state
-            val pageTitle = findNodeByViewId(rootNode, "com.tencent.wework:id/mkq")?.text?.toString() ?: ""
-            Log.d("WeComService", "Current Page Title: $pageTitle")
+            // 1. Identify current screen state (Robust text-based detection)
+            var pageTitle = ""
+            // Look for title-like text at the top of the screen
+            val allNodes = mutableListOf<AccessibilityNodeInfo>()
+            val queue = mutableListOf(rootNode)
+            while (queue.isNotEmpty()) {
+                val node = queue.removeAt(0)
+                val rect = android.graphics.Rect()
+                node.getBoundsInScreen(rect)
+                
+                // Title is usually at the top (y < 250) and has specific text
+                if (rect.top < 250 && rect.height() > 30) {
+                    val text = node.text?.toString() ?: ""
+                    val targets = listOf("群发助手", "企业群发助手", "消息", "工作台", "收件人")
+                    if (targets.contains(text)) {
+                        pageTitle = text
+                        break
+                    }
+                }
+                
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { queue.add(it) }
+                }
+                if (node != rootNode) allNodes.add(node)
+            }
+            allNodes.forEach { it.recycle() }
+            
+            Log.d("WeComService", "Detected Page: $pageTitle")
 
             // 2. Priority Actions based on screen
-            if (pageTitle == "群发助手") {
+            if (pageTitle == "群发助手" || pageTitle == "企业群发助手") {
                 handleMassAssistantPage(rootNode)
                 return
             }
@@ -398,44 +423,43 @@ class WeComAccessibilityService : AccessibilityService() {
         return result
     }
 
-    private fun findNodeByViewId(rootNode: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? {
-        val nodes = rootNode.findAccessibilityNodeInfosByViewId(id)
-        val result = nodes?.firstOrNull()
-        nodes?.forEach { if (it != result) it.recycle() }
-        return result
-    }
-
     private fun findSendButton(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        // 1. Try to find the specific "发送" text node first
-        val nodes = rootNode.findAccessibilityNodeInfosByText("发送")
-        if (!nodes.isNullOrEmpty()) {
-            val spaceRegex = "[\\s\\u00A0\\u2007\\u202F\\u3000]+".toRegex()
-            // Prefer clickable "发送" text
-            val exactButton = nodes.lastOrNull { node ->
-                val text = node.text?.toString()?.replace(spaceRegex, "") ?: ""
-                text == "发送" && (node.isClickable || node.parent?.isClickable == true)
+        // 1. Try to find by exact text "发送"
+        val textNode = findNodeByText(rootNode, "发送", isBottomUp = true)
+        if (textNode != null) {
+            // Check if it's the real button and not a long text
+            val text = textNode.text?.toString() ?: ""
+            if (text.length < 10) {
+                Log.d("WeComService", "Found '发送' button by text")
+                return textNode
             }
-            if (exactButton != null) {
-                nodes.forEach { if (it != exactButton) it.recycle() }
-                Log.d("WeComService", "Found specific '发送' text node")
-                return exactButton
-            }
-            nodes.forEach { it.recycle() }
+            textNode.recycle()
         }
 
-        // 2. Fallback to ID container search
-        val idNodes = rootNode.findAccessibilityNodeInfosByViewId("com.tencent.wework:id/htp")
-        if (!idNodes.isNullOrEmpty()) {
-            val pendingNode = idNodes.lastOrNull { node ->
-                val allText = getAllText(node)
-                allText.contains("发送") && !allText.contains("已发送")
-            }
+        // 2. ID-Agnostic Structural Search: 
+        // Look for a clickable container in the bottom part of a card that contains "发送"
+        val queue = mutableListOf(rootNode)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeAt(0)
             
-            idNodes.forEach { if (it != pendingNode) it.recycle() }
-            if (pendingNode != null) {
-                Log.d("WeComService", "Found Send button container via ID: ${pendingNode.viewIdResourceName}")
-                return pendingNode
+            val text = getAllText(node)
+            if (text.contains("发送") && !text.contains("已发送")) {
+                // If it's a clickable button-like node (FrameLayout/RelativeLayout)
+                if (node.isClickable || node.parent?.isClickable == true) {
+                    val rect = android.graphics.Rect()
+                    node.getBoundsInScreen(rect)
+                    // Massive buttons are usually wide and have decent height
+                    if (rect.width() > 500 && rect.height() > 80) {
+                        Log.d("WeComService", "Found candidate button by structure at ${rect.toShortString()}")
+                        return node 
+                    }
+                }
             }
+
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
+            }
+            if (node != rootNode) node.recycle()
         }
 
         return null
@@ -471,22 +495,41 @@ class WeComAccessibilityService : AccessibilityService() {
         val nodes = rootNode.findAccessibilityNodeInfosByText(text)
         if (nodes.isNullOrEmpty()) return null
 
-        val cleanText = text.replace("\\s+".toRegex(), "")
+        val cleanTarget = text.replace("\\s+".toRegex(), "")
 
-        // 1. Try to find exact matches first (checking both text and contentDescription, ignoring spaces)
-        val exactMatches = nodes.filter { 
-            it.text?.toString()?.replace("\\s+".toRegex(), "") == cleanText || 
-            it.contentDescription?.toString()?.replace("\\s+".toRegex(), "") == cleanText 
+        // 1. Filter out "已发送" and other non-button text if we are looking for "发送"
+        val filteredNodes = if (cleanTarget == "发送") {
+            nodes.filter { 
+                val nodeText = it.text?.toString()?.replace("\\s+".toRegex(), "") ?: ""
+                val nodeDesc = it.contentDescription?.toString()?.replace("\\s+".toRegex(), "") ?: ""
+                val isSent = nodeText.contains("已发送") || nodeDesc.contains("已发送")
+                val isLongText = nodeText.length > 10 // Real button text is short
+                !isSent && !isLongText
+            }
+        } else {
+            nodes
+        }
+
+        if (filteredNodes.isEmpty()) {
+            nodes.forEach { it.recycle() }
+            return null
+        }
+
+        // 2. Try to find exact matches first
+        val exactMatches = filteredNodes.filter { 
+            val nodeText = it.text?.toString()?.replace("\\s+".toRegex(), "") ?: ""
+            val nodeDesc = it.contentDescription?.toString()?.replace("\\s+".toRegex(), "") ?: ""
+            nodeText == cleanTarget || nodeDesc == cleanTarget 
         }
 
         val result = if (exactMatches.isNotEmpty()) {
             if (isBottomUp) exactMatches.last() else exactMatches.first()
         } else {
-            // 2. Fallback to partial matches
-            if (isBottomUp) nodes.last() else nodes.first()
+            // 3. Fallback to partial matches among filtered nodes
+            if (isBottomUp) filteredNodes.last() else filteredNodes.first()
         }
 
-        // Recycle all other nodes in the list that we are NOT returning
+        // Recycle all nodes except the result
         nodes.forEach { if (it != result) it.recycle() }
 
         return result
@@ -508,15 +551,16 @@ class WeComAccessibilityService : AccessibilityService() {
         val result = if (current.isClickable) {
             // First try accessibility click
             val success = current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            Log.d("WeComService", "Accessibility click [${node.text ?: node.contentDescription}]: $success. Class: ${current.className}")
+            Log.d("WeComService", "Accessibility click [${node.text ?: node.contentDescription}]: $success")
             
-            // Special handling for the large htp container or if accessiblity click might be ignored
-            if (current.viewIdResourceName == "com.tencent.wework:id/htp") {
-                // For htp, always try coordinate click at the bottom region
-                clickAtBottomRegionOf(current)
+            // For large containers that might not respond to accessibility clicks,
+            // we ALWAYS perform a coordinate click at the bottom-center as fallback.
+            val rect = android.graphics.Rect()
+            current.getBoundsInScreen(rect)
+            if (rect.width() > 300 && rect.height() > 100) {
+                 clickAtBottomRegionOf(current)
             } else {
-                // For other nodes, use center click
-                clickAtCenterOf(current)
+                 clickAtCenterOf(current)
             }
             success
         } else {
