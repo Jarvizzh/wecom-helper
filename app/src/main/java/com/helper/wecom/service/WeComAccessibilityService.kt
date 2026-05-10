@@ -22,6 +22,7 @@ class WeComAccessibilityService : AccessibilityService() {
     private var lastProcessTime = 0L
     private val THROTTLE_MS = 500L
     private var tickerJob: Job? = null
+    private var workflowJob: Job? = null
 
     // Cached configuration
     private var startHour = 19
@@ -176,10 +177,12 @@ class WeComAccessibilityService : AccessibilityService() {
 
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastProcessTime < THROTTLE_MS) return
+        if (workflowJob?.isActive == true) return
+        
         lastProcessTime = currentTime
 
         // We don't pass the rootNode here to avoid staleness in the coroutine
-        serviceScope.launch {
+        workflowJob = serviceScope.launch {
             try {
                 handleWorkflow()
             } catch (e: Exception) {
@@ -284,30 +287,24 @@ class WeComAccessibilityService : AccessibilityService() {
 
             // 1. Identify current screen state (Robust text-based detection)
             var pageTitle = ""
-            // Look for title-like text at the top of the screen
-            val allNodes = mutableListOf<AccessibilityNodeInfo>()
-            val queue = mutableListOf(rootNode)
-            while (queue.isNotEmpty()) {
-                val node = queue.removeAt(0)
-                val rect = android.graphics.Rect()
-                node.getBoundsInScreen(rect)
-                
-                // Title is usually at the top (y < 250) and has specific text
-                if (rect.top < 250 && rect.height() > 30) {
-                    val text = node.text?.toString() ?: ""
-                    val targets = listOf("群发助手", "企业群发助手", "消息", "工作台", "收件人")
-                    if (targets.contains(text)) {
-                        pageTitle = text
+            val targets = listOf("群发助手", "企业群发助手", "消息", "工作台", "收件人")
+            for (target in targets) {
+                val nodes = rootNode.findAccessibilityNodeInfosByText(target)
+                if (!nodes.isNullOrEmpty()) {
+                    val titleNode = nodes.firstOrNull { 
+                        val rect = android.graphics.Rect()
+                        it.getBoundsInScreen(rect)
+                        // Title is strictly at the very top and usually smaller/centered
+                        rect.centerY() < 200 && rect.height() > 30
+                    }
+                    if (titleNode != null) {
+                        pageTitle = target
+                        nodes.forEach { it.recycle() }
                         break
                     }
                 }
-                
-                for (i in 0 until node.childCount) {
-                    node.getChild(i)?.let { queue.add(it) }
-                }
-                if (node != rootNode) allNodes.add(node)
+                nodes?.forEach { it.recycle() }
             }
-            allNodes.forEach { it.recycle() }
             
             Log.d("WeComService", "Detected Page: $pageTitle")
 
@@ -317,9 +314,10 @@ class WeComAccessibilityService : AccessibilityService() {
                 return
             }
 
-            // ABSOLUTE PRIORITY: Look for "群发助手" item in any list (Message List)
-            // This handles the case where we are on the "Messages" tab or it's visible.
-            if (clickMassAssistantInMessageList(rootNode)) return
+            // NAVIGATION: If in Message List, look for Mass Assistant chat (High Priority)
+            if (pageTitle == "消息") {
+                if (clickMassAssistantInMessageList(rootNode)) return
+            }
 
             if (pageTitle == "收件人" || tryClickByText(rootNode, "发送", isBottomUp = true)) {
                 // If we see a "Send" button and it's likely a sub-page of mass sending
@@ -330,12 +328,7 @@ class WeComAccessibilityService : AccessibilityService() {
                 return
             }
 
-            // 3. Navigation Actions (Priority: Message List -> Workbench)
-            // If in Message List, look for Mass Assistant chat (High Priority)
-            if (pageTitle == "消息") {
-                if (clickMassAssistantInMessageList(rootNode)) return
-            }
-
+            // 3. Navigation Actions (Priority: Workbench)
             // If in Workbench, look for Mass Assistant entry
             if (pageTitle == "工作台") {
                 if (tryClickByText(rootNode, "群发助手")) return
@@ -365,6 +358,26 @@ class WeComAccessibilityService : AccessibilityService() {
                     workbench.recycle()
                 }
             }
+
+            // Ultimate Fallback: Try to go back if we are in a sub-page (e.g. a chat)
+            // Look for a back button in the top-left corner
+            val queue = mutableListOf(rootNode)
+            while (queue.isNotEmpty()) {
+                val node = queue.removeAt(0)
+                val rect = android.graphics.Rect()
+                node.getBoundsInScreen(rect)
+                
+                // Typical back button: top-left, small, clickable
+                if (rect.left < 150 && rect.top < 250 && rect.width() < 200 && (node.isClickable || node.parent?.isClickable == true)) {
+                    Log.d("WeComService", "Lost in sub-page, attempting to go back")
+                    if (clickNode(node)) return
+                }
+
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { queue.add(it) }
+                }
+                if (node != rootNode) node.recycle()
+            }
         } finally {
             rootNode.recycle()
         }
@@ -384,73 +397,112 @@ class WeComAccessibilityService : AccessibilityService() {
             }
         }
 
-        // Ultimate fallback for the blue button region
-        Log.d("WeComService", "Mass Assistant: Triggering coordinate fallback tap")
-        if (dispatchCoordinateClick(900f, 1750f)) {
+        // Ultimate fallback for the blue button region (usually bottom right-ish)
+        val metrics = resources.displayMetrics
+        val x = metrics.widthPixels * 0.85f
+        val y = metrics.heightPixels * 0.9f
+        Log.d("WeComService", "Mass Assistant: Triggering coordinate fallback tap at ($x, $y)")
+        if (dispatchCoordinateClick(x, y)) {
             delay(2000)
         }
     }
 
     private fun clickMassAssistantInMessageList(rootNode: AccessibilityNodeInfo): Boolean {
-        // Search specifically within the message list area to avoid tabs
+        // Search specifically within the message list area
         val nodes = rootNode.findAccessibilityNodeInfosByText("群发助手")
         if (nodes.isNullOrEmpty()) return false
         
-        Log.d("WeComService", "Searching for '群发助手': found ${nodes.size} candidates")
+        Log.d("WeComService", "Searching for '群发助手' in list: found ${nodes.size} candidates")
         
-        // Find the one that belongs to a RelativeLayout (typical for list items)
-        // and is above the tab bar (y < 1700) but below title (y > 200)
+        val screenHeight = resources.displayMetrics.heightPixels
         val rect = android.graphics.Rect()
-        val candidate = nodes.firstOrNull { node ->
+        
+        // Find the one that is likely a Chat List Item
+        val candidateTextNode = nodes.firstOrNull { node ->
             node.getBoundsInScreen(rect)
-            val isMainListArea = rect.centerY() in 200..1700
-            val isListItemText = node.className?.contains("TextView") == true
+            val nodeText = node.text?.toString() ?: ""
+            // Exact match and must be below the title bar area (> 200)
+            val isExact = nodeText == "群发助手"
+            val isBelowTitle = rect.centerY() > 200
+            val isNotBottomTab = rect.centerY() < (screenHeight * 0.9)
             
-            if (isListItemText && !isMainListArea) {
-                Log.d("WeComService", "Skipping Mass Assistant title at y=${rect.centerY()}")
+            isExact && isBelowTitle && isNotBottomTab
+        }
+        
+        if (candidateTextNode != null) {
+            candidateTextNode.getBoundsInScreen(rect)
+            Log.d("WeComService", "Found Mass Assistant item at ${rect.toShortString()}")
+            
+            // CRITICAL: Find the actual clickable row (go up until we find a clickable parent)
+            var parent = candidateTextNode.parent
+            var depth = 0
+            while (parent != null && depth < 5) {
+                if (parent.isClickable) {
+                    val pRect = android.graphics.Rect()
+                    parent.getBoundsInScreen(pRect)
+                    Log.d("WeComService", "Clicking the full row: ${pRect.toShortString()}")
+                    val result = clickNode(parent)
+                    nodes.forEach { it.recycle() }
+                    return result
+                }
+                val nextParent = parent.parent
+                if (parent != rootNode) parent.recycle()
+                parent = nextParent
+                depth++
             }
             
-            isListItemText && isMainListArea
-        }
-        
-        if (candidate != null) {
-            candidate.getBoundsInScreen(rect)
-            Log.d("WeComService", "Found Mass Assistant button at y=${rect.centerY()}")
+            // Fallback to direct click
+            val result = clickNode(candidateTextNode)
+            nodes.forEach { it.recycle() }
+            return result
         }
 
-        val result = if (candidate != null) clickNode(candidate) else false
         nodes.forEach { it.recycle() }
-        return result
+        return false
     }
 
     private fun findSendButton(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        // 1. Try to find by exact text "发送"
-        val textNode = findNodeByText(rootNode, "发送", isBottomUp = true)
-        if (textNode != null) {
-            // Check if it's the real button and not a long text
-            val text = textNode.text?.toString() ?: ""
-            if (text.length < 10) {
-                Log.d("WeComService", "Found '发送' button by text")
-                return textNode
+        val screenHeight = resources.displayMetrics.heightPixels
+        val targets = listOf("发送", "确定", "下一步", "知道了")
+        
+        // 1. Search for text-based buttons in the bottom half of the screen
+        for (target in targets) {
+            val nodes = rootNode.findAccessibilityNodeInfosByText(target)
+            if (!nodes.isNullOrEmpty()) {
+                val button = nodes.lastOrNull { node ->
+                    val rect = android.graphics.Rect()
+                    node.getBoundsInScreen(rect)
+                    // Must be in bottom 40% of screen and likely a real button (not a long paragraph)
+                    rect.centerY() > (screenHeight * 0.6) && (node.text?.length ?: 0) < 15
+                }
+                if (button != null) {
+                    val rect = android.graphics.Rect()
+                    button.getBoundsInScreen(rect)
+                    Log.d("WeComService", "Found '$target' button by text at ${rect.toShortString()}")
+                    nodes.forEach { if (it != button) it.recycle() }
+                    return button
+                }
+                nodes.forEach { it.recycle() }
             }
-            textNode.recycle()
         }
 
         // 2. ID-Agnostic Structural Search: 
-        // Look for a clickable container in the bottom part of a card that contains "发送"
         val queue = mutableListOf(rootNode)
         while (queue.isNotEmpty()) {
             val node = queue.removeAt(0)
             
-            val text = getAllText(node)
+            val text = getAllText(node).replace("\\s+".toRegex(), "")
             if (text.contains("发送") && !text.contains("已发送")) {
-                // If it's a clickable button-like node (FrameLayout/RelativeLayout)
-                if (node.isClickable || node.parent?.isClickable == true) {
-                    val rect = android.graphics.Rect()
-                    node.getBoundsInScreen(rect)
-                    // Massive buttons are usually wide and have decent height
-                    if (rect.width() > 500 && rect.height() > 80) {
-                        Log.d("WeComService", "Found candidate button by structure at ${rect.toShortString()}")
+                val rect = android.graphics.Rect()
+                node.getBoundsInScreen(rect)
+                
+                // Real buttons are usually compact. If the text is too long, it's a message, not a button.
+                val isShortText = text.length < 10
+                
+                // If it's a clickable container in the bottom half
+                if (isShortText && rect.centerY() > (screenHeight * 0.6) && (node.isClickable || node.parent?.isClickable == true)) {
+                    if (rect.width() > 300 && rect.height() > 50) {
+                        Log.d("WeComService", "Found candidate button by structure at ${rect.toShortString()} with text: $text")
                         return node 
                     }
                 }
@@ -526,7 +578,17 @@ class WeComAccessibilityService : AccessibilityService() {
             if (isBottomUp) exactMatches.last() else exactMatches.first()
         } else {
             // 3. Fallback to partial matches among filtered nodes
-            if (isBottomUp) filteredNodes.last() else filteredNodes.first()
+            // For "发送", we allow nodes that START with "发送" or contain it if it's short
+            val relaxedMatches = filteredNodes.filter {
+                val nodeText = it.text?.toString()?.replace("\\s+".toRegex(), "") ?: ""
+                val nodeDesc = it.contentDescription?.toString()?.replace("\\s+".toRegex(), "") ?: ""
+                nodeText.contains(cleanTarget) || nodeDesc.contains(cleanTarget)
+            }
+            if (relaxedMatches.isNotEmpty()) {
+                if (isBottomUp) relaxedMatches.last() else relaxedMatches.first()
+            } else {
+                if (isBottomUp) filteredNodes.last() else filteredNodes.first()
+            }
         }
 
         // Recycle all nodes except the result
