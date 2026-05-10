@@ -33,6 +33,7 @@ class WeComAccessibilityService : AccessibilityService() {
     private var autoWake = false
     private var executionMode = 0 
     private var isWakingUp = false
+    private var wakeLock: PowerManager.WakeLock? = null
     private lateinit var prefs: SharedPreferences
 
     private val configListener = SharedPreferences.OnSharedPreferenceChangeListener { p, key ->
@@ -50,10 +51,36 @@ class WeComAccessibilityService : AccessibilityService() {
         var isRunning = false
     }
 
+    private val WAKE_ACTION = "com.helper.wecom.WAKE_ACTION"
+    private val wakeReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: android.content.Intent?) {
+            if (intent?.action == WAKE_ACTION) {
+                Log.d("WeComService", "Alarm received, waking system")
+                if (isRunning) {
+                    val isInWindow = if (executionMode == 1) isWithinTimeWindow() else true
+                    if (isInWindow) {
+                        checkAndWakeSystem()
+                        triggerWorkflow()
+                    }
+                }
+                scheduleNextWake()
+            }
+        }
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d("WeComService", "Service Connected")
         showNotification()
+        
+        val filter = android.content.IntentFilter(WAKE_ACTION)
+        androidx.core.content.ContextCompat.registerReceiver(
+            this,
+            wakeReceiver,
+            filter,
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        
         prefs = getSharedPreferences("config", Context.MODE_PRIVATE)
         refreshConfig()
         prefs.registerOnSharedPreferenceChangeListener(configListener)
@@ -84,19 +111,27 @@ class WeComAccessibilityService : AccessibilityService() {
     }
 
     private fun startTicker() {
-        tickerJob?.cancel()
-        tickerJob = serviceScope.launch {
-            while (isActive) {
-                if (isRunning) {
-                    val isInWindow = if (executionMode == 1) isWithinTimeWindow() else true
-                    if (isInWindow) {
-                        checkAndWakeSystem()
-                        // 即使没有事件触发，每 5 秒强制检查一遍 UI 状态，防止脚本卡死
-                        triggerWorkflow()
-                    }
-                }
-                delay(5000) 
+        scheduleNextWake()
+    }
+
+    private fun scheduleNextWake() {
+        val am = getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+        val intent = android.content.Intent(WAKE_ACTION).setPackage(packageName)
+        val pi = android.app.PendingIntent.getBroadcast(
+            this, 0, intent,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+        val triggerTime = System.currentTimeMillis() + 5 * 60 * 1000L
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (am.canScheduleExactAlarms()) {
+                am.setExactAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, triggerTime, pi)
+            } else {
+                am.setAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, triggerTime, pi)
             }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            am.setExactAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, triggerTime, pi)
+        } else {
+            am.setExact(android.app.AlarmManager.RTC_WAKEUP, triggerTime, pi)
         }
     }
 
@@ -357,49 +392,30 @@ class WeComAccessibilityService : AccessibilityService() {
         isWakingUp = true
         serviceScope.launch {
             try {
-                @Suppress("DEPRECATION")
-                val wl = pm.newWakeLock(PowerManager.FULL_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP, "Helper:Wake")
-                wl.acquire(3000)
-                if (km.isKeyguardLocked) {
-                    Log.d("WeComService", "Keyguard is locked, attempting multi-swipe unlock")
-                    
-                    val dm = resources.displayMetrics
-                    val screenWidth = dm.widthPixels.toFloat()
-                    val screenHeight = dm.heightPixels.toFloat()
-
-                    // 1. 长距离垂直上滑 (覆盖大部分锁屏)
-                    val path1 = Path().apply {
-                        moveTo(screenWidth * 0.5f, screenHeight * 0.9f)
-                        lineTo(screenWidth * 0.5f, screenHeight * 0.1f)
-                    }
-                    
-                    // 2. 略带偏移的上滑 (应对某些需要特定角度或避开底部控件的手机)
-                    val path2 = Path().apply {
-                        moveTo(screenWidth * 0.7f, screenHeight * 0.85f)
-                        lineTo(screenWidth * 0.3f, screenHeight * 0.2f)
-                    }
-
-                    val gesture1 = GestureDescription.Builder()
-                        .addStroke(GestureDescription.StrokeDescription(path1, 0, 700))
-                        .build()
-                    val gesture2 = GestureDescription.Builder()
-                        .addStroke(GestureDescription.StrokeDescription(path2, 100, 700))
-                        .build()
-
-                    Log.d("WeComService", "Dispatching gesture 1 (Vertical)")
-                    dispatchGesture(gesture1, null, null)
-                    
-                    delay(1200)
-                    
-                    if (km.isKeyguardLocked) {
-                        Log.d("WeComService", "Still locked, dispatching gesture 2 (Diagonal)")
-                        dispatchGesture(gesture2, null, null)
-                        delay(1500)
-                    }
+                // 1. 唤醒屏幕
+                val isInteractive = pm.isInteractive
+                if (!isInteractive) {
+                    Log.d("WeComService", "Screen is off, acquiring wake lock")
+                    @Suppress("DEPRECATION")
+                    wakeLock = pm.newWakeLock(PowerManager.FULL_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP, "Helper:Wake")
+                    wakeLock?.acquire(5000)
                 }
-                delay(2000)
-                launchWeCom()
+
+                delay(2000) // 等待屏幕点亮稳定
+
+                // 2. 解锁并启动应用
+                val intent = android.content.Intent(this@WeComAccessibilityService, com.helper.wecom.ui.UnlockActivity::class.java).apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                }
+                startActivity(intent)
+
+            } catch (e: Exception) {
+                Log.e("WeComService", "Wake/Unlock error", e)
             } finally {
+                wakeLock?.let {
+                    if (it.isHeld) it.release()
+                }
+                wakeLock = null
                 isWakingUp = false
             }
         }
@@ -409,6 +425,18 @@ class WeComAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         prefs.unregisterOnSharedPreferenceChangeListener(configListener)
+        try {
+            unregisterReceiver(wakeReceiver)
+        } catch (e: Exception) {
+            Log.e("WeComService", "Receiver not registered", e)
+        }
+        val am = getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+        val intent = android.content.Intent(WAKE_ACTION).setPackage(packageName)
+        val pi = android.app.PendingIntent.getBroadcast(
+            this, 0, intent,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+        am.cancel(pi)
         serviceScope.cancel()
     }
 }
