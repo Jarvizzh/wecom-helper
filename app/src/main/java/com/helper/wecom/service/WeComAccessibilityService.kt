@@ -361,12 +361,28 @@ class WeComAccessibilityService : AccessibilityService() {
                 val wl = pm.newWakeLock(PowerManager.FULL_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP, "Helper:Wake")
                 wl.acquire(3000)
                 if (km.isKeyguardLocked) {
+                    Log.d("WeComService", "Keyguard is locked, performing unlock swipe")
                     val path = Path().apply {
                         val dm = resources.displayMetrics
-                        moveTo(dm.widthPixels / 2f, dm.heightPixels * 0.8f)
-                        lineTo(dm.widthPixels / 2f, dm.heightPixels * 0.2f)
+                        // 从屏幕底部 15% 处开始向上滑动到 15% 处
+                        moveTo(dm.widthPixels / 2f, dm.heightPixels * 0.85f)
+                        lineTo(dm.widthPixels / 2f, dm.heightPixels * 0.15f)
                     }
-                    dispatchGesture(GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 500)).build(), null, null)
+                    // 增加滑动时长到 600ms，模拟更真实的手势，提高解锁成功率
+                    val gesture = GestureDescription.Builder()
+                        .addStroke(GestureDescription.StrokeDescription(path, 0, 600))
+                        .build()
+                    
+                    val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
+                        override fun onCompleted(gestureDescription: GestureDescription?) {
+                            Log.d("WeComService", "Unlock swipe gesture completed")
+                        }
+                        override fun onCancelled(gestureDescription: GestureDescription?) {
+                            Log.d("WeComService", "Unlock swipe gesture cancelled")
+                        }
+                    }, null)
+                    Log.d("WeComService", "Dispatching unlock swipe gesture: $dispatched")
+                    delay(1500) // 等待解锁动画
                 }
                 delay(2000)
                 launchWeCom()
