@@ -361,28 +361,41 @@ class WeComAccessibilityService : AccessibilityService() {
                 val wl = pm.newWakeLock(PowerManager.FULL_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP, "Helper:Wake")
                 wl.acquire(3000)
                 if (km.isKeyguardLocked) {
-                    Log.d("WeComService", "Keyguard is locked, performing unlock swipe")
-                    val path = Path().apply {
-                        val dm = resources.displayMetrics
-                        // 从屏幕底部 15% 处开始向上滑动到 15% 处
-                        moveTo(dm.widthPixels / 2f, dm.heightPixels * 0.85f)
-                        lineTo(dm.widthPixels / 2f, dm.heightPixels * 0.15f)
-                    }
-                    // 增加滑动时长到 600ms，模拟更真实的手势，提高解锁成功率
-                    val gesture = GestureDescription.Builder()
-                        .addStroke(GestureDescription.StrokeDescription(path, 0, 600))
-                        .build()
+                    Log.d("WeComService", "Keyguard is locked, attempting multi-swipe unlock")
                     
-                    val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
-                        override fun onCompleted(gestureDescription: GestureDescription?) {
-                            Log.d("WeComService", "Unlock swipe gesture completed")
-                        }
-                        override fun onCancelled(gestureDescription: GestureDescription?) {
-                            Log.d("WeComService", "Unlock swipe gesture cancelled")
-                        }
-                    }, null)
-                    Log.d("WeComService", "Dispatching unlock swipe gesture: $dispatched")
-                    delay(1500) // 等待解锁动画
+                    val dm = resources.displayMetrics
+                    val screenWidth = dm.widthPixels.toFloat()
+                    val screenHeight = dm.heightPixels.toFloat()
+
+                    // 1. 长距离垂直上滑 (覆盖大部分锁屏)
+                    val path1 = Path().apply {
+                        moveTo(screenWidth * 0.5f, screenHeight * 0.9f)
+                        lineTo(screenWidth * 0.5f, screenHeight * 0.1f)
+                    }
+                    
+                    // 2. 略带偏移的上滑 (应对某些需要特定角度或避开底部控件的手机)
+                    val path2 = Path().apply {
+                        moveTo(screenWidth * 0.7f, screenHeight * 0.85f)
+                        lineTo(screenWidth * 0.3f, screenHeight * 0.2f)
+                    }
+
+                    val gesture1 = GestureDescription.Builder()
+                        .addStroke(GestureDescription.StrokeDescription(path1, 0, 700))
+                        .build()
+                    val gesture2 = GestureDescription.Builder()
+                        .addStroke(GestureDescription.StrokeDescription(path2, 100, 700))
+                        .build()
+
+                    Log.d("WeComService", "Dispatching gesture 1 (Vertical)")
+                    dispatchGesture(gesture1, null, null)
+                    
+                    delay(1200)
+                    
+                    if (km.isKeyguardLocked) {
+                        Log.d("WeComService", "Still locked, dispatching gesture 2 (Diagonal)")
+                        dispatchGesture(gesture2, null, null)
+                        delay(1500)
+                    }
                 }
                 delay(2000)
                 launchWeCom()
