@@ -42,6 +42,7 @@ class MainActivity : ComponentActivity() {
             var showSheet by remember { mutableStateOf(false) }
 
             // Configuration states
+            var taskType by remember { mutableStateOf(prefs.getInt("taskType", 0)) } // 0: 群发任务, 1: 清理单向好友
             var executionMode by remember { mutableStateOf(prefs.getInt("executionMode", 0)) } // 0: Immediate, 1: Scheduled
             var startHour by remember { mutableStateOf(prefs.getInt("startHour", 19)) }
             var startMinute by remember { mutableStateOf(prefs.getInt("startMinute", 0)) }
@@ -60,16 +61,26 @@ class MainActivity : ComponentActivity() {
                         onOpenSettings = {
                             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                         },
-                        onActionClick = {
-                            if (isRunning) {
-                                WeComAccessibilityService.isRunning = false
-                                isRunning = false
+                        onStopClick = {
+                            WeComAccessibilityService.isRunning = false
+                            isRunning = false
+                        },
+                        onGroupMessageClick = {
+                            if (!isServiceEnabledState) {
+                                Toast.makeText(this@MainActivity, "请先开启辅助功能权限", Toast.LENGTH_SHORT).show()
                             } else {
-                                if (!isServiceEnabledState) {
-                                    Toast.makeText(this, "请先开启辅助功能权限", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    showSheet = true
-                                }
+                                taskType = 0
+                                prefs.edit().putInt("taskType", 0).apply()
+                                showSheet = true
+                            }
+                        },
+                        onCleanFriendsClick = {
+                            if (!isServiceEnabledState) {
+                                Toast.makeText(this@MainActivity, "请先开启辅助功能权限", Toast.LENGTH_SHORT).show()
+                            } else {
+                                taskType = 1
+                                prefs.edit().putInt("taskType", 1).apply()
+                                showSheet = true
                             }
                         }
                     )
@@ -151,7 +162,9 @@ fun MainScreen(
     isServiceEnabled: Boolean,
     isRunning: Boolean,
     onOpenSettings: () -> Unit,
-    onActionClick: () -> Unit
+    onStopClick: () -> Unit,
+    onGroupMessageClick: () -> Unit,
+    onCleanFriendsClick: () -> Unit
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -188,7 +201,7 @@ fun MainScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = if (isRunning) "自动化运行中..." else "准备绪，点击下方按钮开始",
+                text = if (isRunning) "自动化运行中..." else "准备就绪，点击下方按钮开始",
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -228,21 +241,58 @@ fun MainScreen(
 
             Spacer(modifier = Modifier.height(64.dp))
 
-            // Main Action Button
-            Button(
-                onClick = onActionClick,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(64.dp),
-                shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isRunning) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
-                )
-            ) {
-                Text(
-                    text = if (isRunning) "停止自动化任务" else "开始群发任务",
-                    style = MaterialTheme.typography.titleLarge
-                )
+            if (isRunning) {
+                // Stop Button
+                Button(
+                    onClick = onStopClick,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(64.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text(
+                        text = "停止自动化任务",
+                        style = MaterialTheme.typography.titleLarge
+                    )
+                }
+            } else {
+                // Two separate action buttons
+                Button(
+                    onClick = onGroupMessageClick,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(64.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary
+                    )
+                ) {
+                    Text(
+                        text = "开始群发任务",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                Button(
+                    onClick = onCleanFriendsClick,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(64.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.secondary
+                    )
+                ) {
+                    Text(
+                        text = "开始清理单向好友",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
             }
         }
     }
@@ -283,10 +333,17 @@ fun ConfigBottomSheet(
             Spacer(modifier = Modifier.height(24.dp))
 
             // Execution Mode Selection
+            Text(
+                text = "选择执行模式",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.align(Alignment.Start)
+            )
+            Spacer(modifier = Modifier.height(8.dp))
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(56.dp)
+                    .height(48.dp)
                     .clip(RoundedCornerShape(12.dp))
                     .background(MaterialTheme.colorScheme.surfaceVariant),
                 verticalAlignment = Alignment.CenterVertically
