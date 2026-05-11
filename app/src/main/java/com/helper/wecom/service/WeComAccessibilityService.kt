@@ -33,6 +33,7 @@ class WeComAccessibilityService : AccessibilityService() {
     private var endMinute = 10
     private var autoWake = false
     private var executionMode = 0 
+    private var wakeInterval = 5 // 默认5分钟
     private var isWakingUp = false
     private var wakeLock: PowerManager.WakeLock? = null
     private lateinit var prefs: SharedPreferences
@@ -46,6 +47,10 @@ class WeComAccessibilityService : AccessibilityService() {
             "endMinute" -> endMinute = p.getInt("endMinute", 10)
             "autoWake" -> autoWake = p.getBoolean("autoWake", false)
             "executionMode" -> executionMode = p.getInt("executionMode", 0)
+            "wakeInterval" -> {
+                wakeInterval = p.getInt("wakeInterval", 5)
+                scheduleNextWake() // 间隔改变时重新排期
+            }
         }
     }
 
@@ -97,6 +102,7 @@ class WeComAccessibilityService : AccessibilityService() {
         endMinute = prefs.getInt("endMinute", 10)
         autoWake = prefs.getBoolean("autoWake", false)
         executionMode = prefs.getInt("executionMode", 0)
+        wakeInterval = prefs.getInt("wakeInterval", 5)
     }
 
     private fun showNotification() {
@@ -124,7 +130,10 @@ class WeComAccessibilityService : AccessibilityService() {
             this, 0, intent,
             android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
         )
-        val triggerTime = System.currentTimeMillis() + 5 * 60 * 1000L
+        // 使用动态设置的间隔
+        val intervalMs = if (wakeInterval < 1) 5 * 60 * 1000L else wakeInterval * 60 * 1000L
+        val triggerTime = System.currentTimeMillis() + intervalMs
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             if (am.canScheduleExactAlarms()) {
                 am.setExactAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, triggerTime, pi)
@@ -169,6 +178,14 @@ class WeComAccessibilityService : AccessibilityService() {
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastProcessTime < THROTTLE_MS) return
         if (workflowJob?.isActive == true) return
+
+        // 核心修复：校验执行模式和时间窗口
+        if (executionMode == 1) { // 如果是定时模式
+            if (!isWithinTimeWindow()) {
+                // 不在时间窗口内，跳过触发
+                return
+            }
+        }
 
         lastProcessTime = currentTime
         workflowJob = serviceScope.launch {

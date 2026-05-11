@@ -49,6 +49,7 @@ class MainActivity : ComponentActivity() {
             var endHour by remember { mutableStateOf(prefs.getInt("endHour", 21)) }
             var endMinute by remember { mutableStateOf(prefs.getInt("endMinute", 30)) }
             var autoWake by remember { mutableStateOf(prefs.getBoolean("autoWake", false)) }
+            var wakeInterval by remember { mutableStateOf(prefs.getInt("wakeInterval", 5)) }
 
             WeComHelperTheme {
                 Surface(
@@ -93,13 +94,15 @@ class MainActivity : ComponentActivity() {
                             endHour = endHour,
                             endMinute = endMinute,
                             autoWake = autoWake,
-                            onConfigChange = { mode, h1, m1, h2, m2, wake ->
+                            wakeInterval = wakeInterval,
+                            onConfigChange = { mode, h1, m1, h2, m2, wake, interval ->
                                 executionMode = mode
                                 startHour = h1
                                 startMinute = m1
                                 endHour = h2
                                 endMinute = m2
                                 autoWake = wake
+                                wakeInterval = interval
                                 prefs.edit().apply {
                                     putInt("executionMode", mode)
                                     putInt("startHour", h1)
@@ -107,6 +110,7 @@ class MainActivity : ComponentActivity() {
                                     putInt("endHour", h2)
                                     putInt("endMinute", m2)
                                     putBoolean("autoWake", wake)
+                                    putInt("wakeInterval", interval)
                                     apply()
                                 }
                             },
@@ -307,7 +311,8 @@ fun ConfigBottomSheet(
     endHour: Int,
     endMinute: Int,
     autoWake: Boolean,
-    onConfigChange: (Int, Int, Int, Int, Int, Boolean) -> Unit,
+    wakeInterval: Int,
+    onConfigChange: (Int, Int, Int, Int, Int, Boolean, Int) -> Unit,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -352,13 +357,13 @@ fun ConfigBottomSheet(
                     text = "立即执行",
                     selected = executionMode == 0,
                     modifier = Modifier.weight(1f),
-                    onClick = { onConfigChange(0, startHour, startMinute, endHour, endMinute, autoWake) }
+                    onClick = { onConfigChange(0, startHour, startMinute, endHour, endMinute, autoWake, wakeInterval) }
                 )
                 ModeTab(
                     text = "定时执行",
                     selected = executionMode == 1,
                     modifier = Modifier.weight(1f),
-                    onClick = { onConfigChange(1, startHour, startMinute, endHour, endMinute, autoWake) }
+                    onClick = { onConfigChange(1, startHour, startMinute, endHour, endMinute, autoWake, wakeInterval) }
                 )
             }
 
@@ -378,11 +383,11 @@ fun ConfigBottomSheet(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         TimeBox(hour = startHour, minute = startMinute, label = "开始时间") { h, m ->
-                            onConfigChange(1, h, m, endHour, endMinute, autoWake)
+                            onConfigChange(1, h, m, endHour, endMinute, autoWake, wakeInterval)
                         }
                         Text("至", modifier = Modifier.padding(horizontal = 8.dp), style = MaterialTheme.typography.bodyLarge)
                         TimeBox(hour = endHour, minute = endMinute, label = "结束时间") { h, m ->
-                            onConfigChange(1, startHour, startMinute, h, m, autoWake)
+                            onConfigChange(1, startHour, startMinute, h, m, autoWake, wakeInterval)
                         }
                     }
                 }
@@ -406,8 +411,33 @@ fun ConfigBottomSheet(
                 }
                 Switch(
                     checked = autoWake,
-                    onCheckedChange = { onConfigChange(executionMode, startHour, startMinute, endHour, endMinute, it) }
+                    onCheckedChange = { onConfigChange(executionMode, startHour, startMinute, endHour, endMinute, it, wakeInterval) }
                 )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Wake Interval Selection
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column {
+                    Text(text = "唤醒检查间隔", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                    Text(text = "每隔多久检查一次是否需要执行", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TimeDigit(value = wakeInterval) { 
+                        if (it > 0) onConfigChange(executionMode, startHour, startMinute, endHour, endMinute, autoWake, it) 
+                    }
+                    Text(" 分钟", style = MaterialTheme.typography.bodyMedium)
+                }
             }
 
             Spacer(modifier = Modifier.height(32.dp))
