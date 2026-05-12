@@ -208,6 +208,8 @@ class WeComAccessibilityService : AccessibilityService() {
             handleGroupMessageTask(rootNode)
         } else if (taskType == 1) {
             handleDeleteOneWayFriendsTask(rootNode)
+        } else if (taskType == 2) {
+            handleDisbandGroupTask(rootNode)
         }
         
         rootNode.recycle()
@@ -475,8 +477,185 @@ class WeComAccessibilityService : AccessibilityService() {
         return null
     }
 
+    private suspend fun handleDisbandGroupTask(rootNode: AccessibilityNodeInfo) {
+        val pageTitle = detectPageTitle(rootNode)
+        Log.d("WeComService", "Disband Step: Current Page is '$pageTitle'")
+
+        // 1. 优先检查确认弹窗 (Confirm Disband)
+        // 弹窗按钮文字通常就是精准的“解散”或“确定”
+        val confirmCandidates = rootNode.findAccessibilityNodeInfosByText("解散")
+        val dialogConfirm = confirmCandidates?.firstOrNull {
+            val rect = Rect()
+            it.getBoundsInScreen(rect)
+            val text = it.text?.toString() ?: ""
+            // 特征：文字精准匹配，且宽度较小（排除掉底部的“解散群聊”大按钮）
+            text == "解散" && rect.width() < 500
+        }
+
+        if (dialogConfirm != null) {
+            Log.d("WeComService", "Disband Step: Clicking final 'Disband' confirmation")
+            clickNode(dialogConfirm)
+            confirmCandidates.forEach { it.recycle() }
+            delay(1500)
+            return
+        }
+        confirmCandidates?.forEach { it.recycle() }
+
+        // 备选确认按钮：“确定”
+        val okNode = findNodeByText(rootNode, "确定")
+        if (okNode != null) {
+            val rect = Rect()
+            okNode.getBoundsInScreen(rect)
+            if (rect.width() < 500) {
+                Log.d("WeComService", "Disband Step: Clicking 'OK' confirmation")
+                clickNode(okNode)
+                okNode.recycle()
+                delay(1500)
+                return
+            }
+            okNode.recycle()
+        }
+
+        // 2. 检查是否在“群管理”设置页面（包含“解散群聊”按钮）
+        val disbandActionBtn = findNodeByText(rootNode, "解散群聊")
+        if (disbandActionBtn != null) {
+            Log.d("WeComService", "Disband Step: Found 'Disband Group' button")
+            clickNode(disbandActionBtn)
+            disbandActionBtn.recycle()
+            delay(800)
+            return
+        }
+
+        // 3. 检查是否在“群信息/详情”页面（包含“群管理”跳转选项）
+        val managementEntry = findClickableNodeByText(rootNode, "群管理")
+        if (managementEntry != null) {
+            val rect = Rect()
+            managementEntry.getBoundsInScreen(rect)
+            // 排除标题栏（通常在顶部 < 300）
+            if (rect.centerY() > 300) {
+                Log.d("WeComService", "Disband Step: Found 'Group Management' entry, clicking...")
+                clickNode(managementEntry)
+                managementEntry.recycle()
+                delay(1000)
+                return
+            }
+            managementEntry.recycle()
+        }
+
+        // 4. 处理群列表页逻辑
+        if (pageTitle == "我的学员群" || pageTitle == "我的客户群" || hasGroupList(rootNode)) {
+            Log.d("WeComService", "Disband Step: At Group List Page")
+            var firstGroup = findFirstGroupNode(rootNode)
+            if (firstGroup == null) {
+                // 可能是数据加载延迟，尝试等待 1 秒并重新获取 rootNode 再次查找
+                delay(1000)
+                rootInActiveWindow?.let { 
+                    firstGroup = findFirstGroupNode(it)
+                    if (firstGroup == null) it.recycle()
+                }
+            }
+
+            if (firstGroup != null) {
+                val groupNode = firstGroup!!
+                Log.d("WeComService", "Disband Step: Clicking first group")
+                clickNode(groupNode)
+                groupNode.recycle()
+                delay(1200)
+            } else {
+                Log.d("WeComService", "Disband Step: No group found in list, task may be finished.")
+                isRunning = false
+            }
+            return
+        }
+
+        // 5. 兜底逻辑：如果在群信息页但“群管理”在屏幕下方，尝试滚动
+        val scrollable = findScrollableNode(rootNode)
+        if (scrollable != null) {
+            Log.d("WeComService", "Disband Step: Unknown page content, trying to scroll...")
+            scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+            scrollable.recycle()
+            delay(1000)
+        } else {
+            Log.d("WeComService", "Disband Step: Nothing to do, performing back")
+            performBackClick(rootNode)
+        }
+    }
+
+    private fun hasGroupList(root: AccessibilityNodeInfo): Boolean {
+        return findNodeByText(root, "我的学员群") != null || findNodeByText(root, "我的客户群") != null
+    }
+
+    private fun findFirstGroupNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        // 1. 优先尝试从滚动容器中寻找
+        val scrollable = findScrollableNode(root)
+        if (scrollable != null) {
+            for (i in 0 until scrollable.childCount) {
+                val child = scrollable.getChild(i) ?: continue
+                if (isGroupItem(child)) {
+                    scrollable.recycle()
+                    return child
+                }
+                child.recycle()
+            }
+            scrollable.recycle()
+        }
+
+        // 2. 备选方案：全量遍历搜索屏幕中段的可点击项
+        return findFirstClickableInListArea(root)
+    }
+
+    private fun isGroupItem(node: AccessibilityNodeInfo): Boolean {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        // 特征：屏幕中段 (排除搜索框和底部导航)、高度适中、且可点击
+        return rect.centerY() in 401..1799 && rect.height() > 100 && node.isClickable
+    }
+
+    private fun findFirstClickableInListArea(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val queue: java.util.Queue<AccessibilityNodeInfo> = java.util.LinkedList()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val node = queue.poll() ?: continue
+            if (isGroupItem(node) && node != root) {
+                // 找到了符合条件的第一个节点，清理队列并返回
+                while (queue.isNotEmpty()) queue.poll()?.recycle()
+                return node
+            }
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
+            }
+            if (node != root) node.recycle()
+        }
+        return null
+    }
+
+    private fun findNodeByContentDescription(root: AccessibilityNodeInfo, desc: String): AccessibilityNodeInfo? {
+        if (root.contentDescription?.toString() == desc) return root
+        for (i in 0 until root.childCount) {
+            val child = root.getChild(i) ?: continue
+            val found = findNodeByContentDescription(child, desc)
+            if (found != null) {
+                // Don't recycle child if it's the one we found
+                return found
+            }
+            child.recycle()
+        }
+        return null
+    }
+
+    private fun findNodeByClassName(root: AccessibilityNodeInfo, className: String): AccessibilityNodeInfo? {
+        if (root.className?.toString() == className) return root
+        for (i in 0 until root.childCount) {
+            val child = root.getChild(i) ?: continue
+            val found = findNodeByClassName(child, className)
+            if (found != null) return found
+            child.recycle()
+        }
+        return null
+    }
+
     private fun detectPageTitle(root: AccessibilityNodeInfo): String {
-        val targets = listOf("群发助手", "待发送的企业消息", "待发送", "详情", "工作台", "消息", "通讯录", "我的学员", "单向微信学员")
+        val targets = listOf("群发助手", "待发送的企业消息", "待发送", "详情", "工作台", "消息", "通讯录", "我的学员群", "群管理", "我的学员", "单向微信学员")
         for (target in targets) {
             val nodes = root.findAccessibilityNodeInfosByText(target)
             val match = nodes?.firstOrNull {

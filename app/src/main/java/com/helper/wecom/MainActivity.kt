@@ -83,6 +83,15 @@ class MainActivity : ComponentActivity() {
                                 prefs.edit().putInt("taskType", 1).apply()
                                 showSheet = true
                             }
+                        },
+                        onDisbandGroupClick = {
+                            if (!isServiceEnabledState) {
+                                Toast.makeText(this@MainActivity, "请先开启辅助功能权限", Toast.LENGTH_SHORT).show()
+                            } else {
+                                taskType = 2
+                                prefs.edit().putInt("taskType", 2).apply()
+                                showSheet = true
+                            }
                         }
                     )
 
@@ -168,7 +177,8 @@ fun MainScreen(
     onOpenSettings: () -> Unit,
     onStopClick: () -> Unit,
     onGroupMessageClick: () -> Unit,
-    onCleanFriendsClick: () -> Unit
+    onCleanFriendsClick: () -> Unit,
+    onDisbandGroupClick: () -> Unit
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -294,6 +304,24 @@ fun MainScreen(
                 ) {
                     Text(
                         text = "开始清理单向好友",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Button(
+                    onClick = onDisbandGroupClick,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(64.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.tertiary
+                    )
+                ) {
+                    Text(
+                        text = "自动解散群聊",
                         style = MaterialTheme.typography.titleMedium
                     )
                 }
